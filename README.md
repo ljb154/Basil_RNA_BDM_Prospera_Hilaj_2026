@@ -123,10 +123,3 @@ The following R package versions were used in the original analysis:
 Open `calculate_DEGs_deseq2_pub.Rmd` in RStudio and click **Knit**.
 
 The document determines its project directory from the location of the `.Rmd` file, reads the three input files from `inputs/`, and creates `results/` and `objects/` as needed. No changes to absolute file paths or manual `setwd()` commands are required when knitting.
-
-## Reproducibility notes
-
--   The BLASTP settings above reproduce the original search parameters, but using the current Swiss-Prot database may yield different hits. To reproduce the December 2025 annotation exactly, an archived copy of the Swiss-Prot release used at that time would be needed.
--   The R Markdown analysis also downloads GOA data from an external source, which can change over time.
--   Running BLASTP against a full Swiss-Prot database may take substantial time and disk space. The original workflow used a computing cluster.
--   `blast_work/` contains large intermediate files and should not be committed to GitHub. Consider adding `blast_work/`, `results/`, `objects/`, and `inputs/Perrie_v1.0_blast_results.tsv.gz` to `.gitignore`.
