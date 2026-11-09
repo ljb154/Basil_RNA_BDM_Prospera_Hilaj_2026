@@ -1,0 +1,25 @@
+﻿SampleNumber,SampleName,GroupName,Variety,Resistance,Time,Treatment,Replicate,Description of Experimental Design**
+1,A201_C1,A,201,Susceptible,24,control,1,The plant was mock inoculated with DI water and the leaves are used for RNA-Seq as control. There are three biological sample repeats in each group.
+2,A201_C2,A,201,Susceptible,24,control,2,The plant was mock inoculated with DI water and the leaves are used for RNA-Seq as control. There are three biological sample repeats in each group.
+3,A201_C3,A,201,Susceptible,24,control,3,The plant was mock inoculated with DI water and the leaves are used for RNA-Seq as control. There are three biological sample repeats in each group.
+4,FEM_C1,B,FEM,Resistant,24,control,1,The plant was mock inoculated with DI water and the leaves are used for RNA-Seq as control. There are three biological sample repeats in each group.
+5,FEM_C2,B,FEM,Resistant,24,control,2,The plant was mock inoculated with DI water and the leaves are used for RNA-Seq as control. There are three biological sample repeats in each group.
+6,FEM_C3,B,FEM,Resistant,24,control,3,The plant was mock inoculated with DI water and the leaves are used for RNA-Seq as control. There are three biological sample repeats in each group.
+7,A201_24h_I1,C,201,Susceptible,24,inoculated,1,"The plant was inoculated with P. belbahrii, sampled after 24 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+8,A201_24h_I2,C,201,Susceptible,24,inoculated,2,"The plant was inoculated with P. belbahrii, sampled after 24 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+9,A201_24h_I3,C,201,Susceptible,24,inoculated,3,"The plant was inoculated with P. belbahrii, sampled after 24 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+10,FEM_24h_I1,D,FEM,Resistant,24,inoculated,1,"The plant was inoculated with P. belbahrii, sampled after 24 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+11,FEM_24h_I2,D,FEM,Resistant,24,inoculated,2,"The plant was inoculated with P. belbahrii, sampled after 24 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+12,FEM_24h_I3,D,FEM,Resistant,24,inoculated,3,"The plant was inoculated with P. belbahrii, sampled after 24 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+13,A201_48h_I1,E,201,Susceptible,48,inoculated,1,"The plant was inoculated with P. belbahrii, sampled after 48 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+14,A201_48h_I2,E,201,Susceptible,48,inoculated,2,"The plant was inoculated with P. belbahrii, sampled after 48 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+15,A201_48h_I3,E,201,Susceptible,48,inoculated,3,"The plant was inoculated with P. belbahrii, sampled after 48 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+16,FEM_48h_I1,F,FEM,Resistant,48,inoculated,1,"The plant was inoculated with P. belbahrii, sampled after 48 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+17,FEM_48h_I2,F,FEM,Resistant,48,inoculated,2,"The plant was inoculated with P. belbahrii, sampled after 48 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+18,FEM_48h_I3,F,FEM,Resistant,48,inoculated,3,"The plant was inoculated with P. belbahrii, sampled after 48 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+19,A201_72h_I1,G,201,Susceptible,72,inoculated,1,"The plant was inoculated with P. belbahrii, sampled after 72 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+20,A201_72h_I2,G,201,Susceptible,72,inoculated,2,"The plant was inoculated with P. belbahrii, sampled after 72 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+21,A201_72h_I3,G,201,Susceptible,72,inoculated,3,"The plant was inoculated with P. belbahrii, sampled after 72 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+22,FEM_72h_I1,H,FEM,Resistant,72,inoculated,1,"The plant was inoculated with P. belbahrii, sampled after 72 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+23,FEM_72h_I2,H,FEM,Resistant,72,inoculated,2,"The plant was inoculated with P. belbahrii, sampled after 72 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
+24,FEM_72h_I3,H,FEM,Resistant,72,inoculated,3,"The plant was inoculated with P. belbahrii, sampled after 72 hours and the leaves are used for RNA-Seq. There are three biological sample repeats in each group."
