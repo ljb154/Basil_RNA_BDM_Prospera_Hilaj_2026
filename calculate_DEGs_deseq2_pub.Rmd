@@ -1,0 +1,2225 @@
+---
+title: "calculate_DEGs_deseq2"
+author: "Lara J. Brindisi"
+date: "2025-12-11"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document.
+Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents.
+For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document.
+You can embed an R code chunk like this:
+
+## Set up
+
+```{r}
+library(DESeq2)
+library(stringr)
+library(ggplot2)
+library(gridExtra)
+library(gplots)
+library(viridis)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(topGO)
+library(cowplot)
+library(eulerr)
+library(VennDiagram)
+library(GO.db)
+library(AnnotationDbi)
+library(ggrepel)
+library(patchwork)
+
+```
+
+```{r}
+R.version.string
+packageVersion("DESeq2")
+packageVersion("stringr")
+packageVersion("ggplot2")
+packageVersion("gridExtra")
+packageVersion("gplots")
+packageVersion("viridis")
+packageVersion("dplyr")
+packageVersion("tidyr")
+packageVersion("tibble")
+packageVersion("topGO")
+packageVersion("cowplot")
+packageVersion("eulerr")
+packageVersion("VennDiagram")
+packageVersion("GO.db")
+packageVersion("AnnotationDbi")
+```
+
+```{r}
+# Define directories
+project_dir <- dirname(normalizePath(knitr::current_input(dir = TRUE)))
+counts_dir <- file.path(project_dir, "inputs")
+metadata_dir <- file.path(project_dir, "inputs")
+blast_dir <- file.path(project_dir, "inputs")
+objects_dir <- file.path(project_dir, "objects")
+results_dir <- file.path(project_dir, "results")
+
+# make sure directories exist
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(objects_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Set working directory
+setwd(project_dir)
+```
+
+```{r}
+# Load and clean counts data
+counts <- read.table(paste0(counts_dir, "/gene_count_matrix.txt"), header = TRUE, row.names = 1)
+anyDuplicated(colnames(counts)) # 0
+print(head(capture.output(str(counts)))) #85714 obs./genes # usually ~25,000 genes this is a lot
+```
+
+```{r}
+# Filter lowly expressed genes (5 count) in at least 50% of the libraries, strict threshold
+filtered_counts <- counts
+num_libraries <- ncol(filtered_counts)
+threshold_libraries <- ceiling(0.5 * num_libraries)
+expressed_in_enough_libraries <- rowSums(filtered_counts >= 5) >= threshold_libraries
+filtered_counts <- filtered_counts[expressed_in_enough_libraries, ]
+print(head(capture.output(str(filtered_counts)))) # 51043 obs./genes # still double what's expected
+```
+
+```{r}
+# Load metadata
+metadata <- read.csv(paste0(metadata_dir,"/metadata_LB.csv"))
+metadata <- metadata %>% dplyr::select(-`Description.of.Experimental.Design..`)
+summary(metadata)
+```
+
+```{r}
+# Parse description column and convert to factors
+metadata$variety <- factor(metadata$Variety)
+metadata$time <- factor(metadata$Time)
+metadata$treatment <- factor(metadata$Treatment)
+
+# Remove samples from metadata that are missing from counts data
+metadata <- metadata %>%
+  filter(!SampleName %in% c("FEM_24h_I3", "FEM_72h_I1"))
+
+# Reorder metadata to match counts
+metadata <- metadata[match(colnames(counts), metadata$SampleName), ]
+all(metadata$SampleName == colnames(counts)) # should return true if all are matching
+```
+
+```{r}
+# create contingency tables to observe experiment structure
+table(metadata$variety, metadata$time, metadata$treatment)
+  # only 2 samples for FEM-24h and FEM-72h
+  # control samples only at 24h
+
+# Convert time to numeric
+metadata$time_numeric <- as.numeric(metadata$time)
+
+# Scale time
+metadata$time_numeric_scaled <- scale(metadata$time_numeric, center = TRUE, scale = TRUE)
+
+# Set reference levels for interaction term
+metadata$variety <- relevel(metadata$variety, ref = "201")
+metadata$time <- relevel(metadata$time, ref = "24")
+metadata$treatment <- relevel(metadata$treatment, ref = "control")
+
+```
+
+```{r}
+# load blastp results
+blastp_results <- read.delim(gzfile(file.path(blast_dir,"Perrie_v1.0_blast_results.tsv.gz")),header = FALSE,stringsAsFactors = FALSE)
+colnames(blastp_results) <- c("query", "subject", "pident", "length", "mismatch", "gapopen",
+                              "qstart", "qend", "sstart", "send", "evalue", "bitscore", "description")
+head(blastp_results)
+blastp_results$gene <- sub("\\.[0-9]+$", "", blastp_results$query) # change to format gene 
+
+# Extract UniProt IDs for all genes 
+blastp_results$uniprot_id <- sub("sp\\|([^|]+)\\|.*", "\\1", blastp_results$subject)
+
+# Filter for top hit per gene
+blast_top <- blastp_results %>%
+  group_by(gene) %>%
+  slice_min(order_by = evalue, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+```
+
+```{r}
+# Gene enrichment prep
+
+# Download GOA uniprot gene association file to map uniprot protein accessions to gene ontology terms
+options(timeout = 600)
+url <- "https://ftp.ebi.ac.uk/pub/databases/GO/goa/ARABIDOPSIS/goa_arabidopsis.gaf.gz"
+con <- gzcon(url(url, "rb"))  # 'rb' = read binary to read directly from gzipped connection
+goa_lines <- readLines(con)
+close(con)
+
+# Remove comments and split tab-delimited lines
+goa_data <- goa_lines[!startsWith(goa_lines, "!")]
+goa <- read.delim(textConnection(goa_data), header = FALSE, stringsAsFactors = FALSE)
+colnames(goa)[1:7] <- c("DB", "UniProt_ID", "DB_Object_Symbol", "Qualifier", "GO_ID", "DB_Reference", "Evidence_Code")
+```
+
+
+## Model everything (Wald)
+
+```{r}
+# Full model design ~ variety * treatment * time will run into rank-deficiency because no controls at 28 or 72 h
+# Need to break into groups
+metadata$group <- factor(with(metadata, paste(Variety, Treatment, Time, sep = "_")))
+
+# i.e. the genes should behave in response to cps as they do to che
+dds <- DESeqDataSetFromMatrix(countData = filtered_counts,
+                              colData = metadata,
+                              design = ~ group)
+
+# Filter lowly expressed genes where 2 samples have > 10 counts (because at least 2 replicates)
+keep <- rowSums(counts(dds) >= 10) >= 2
+dds <- dds[keep,]
+model <- DESeq(dds)
+
+# If the above fails to converge, remove genes that will not work in binomial model
+while (any(mcols(model)$betaConv == FALSE)) {
+  keep_converge <- mcols(model)$betaConv
+  dds <- dds[keep_converge,]
+  model <- DESeq(dds)
+}
+
+# save dds result
+saveRDS(dds, file = paste0(objects_dir, "/all_wald_dds.RData"))
+saveRDS(model, file = paste0(objects_dir, "/all_wald_model.RData"))
+
+```
+
+```{r}
+# Summarize model results
+dds <- readRDS(file=paste0(objects_dir, "/all_wald_dds.RData"))
+model <- readRDS(file=paste0(objects_dir, "/all_wald_model.RData"))
+print(resultsNames(model))
+print(summary(results(model)))
+```
+
+```{r}
+# Plot dispersion
+dds <- readRDS(file=paste0(objects_dir, "/all_wald_dds.RData"))
+model <- readRDS(file=paste0(objects_dir, "/all_wald_model.RData"))
+plotDispEsts(model)
+attr(dispersionFunction(model), "coefficients")
+
+```
+
+
+### Extract DEGs
+
+```{r}
+# Extract interaction terms for simple contrasts
+dds <- readRDS(file=paste0(objects_dir, "/all_wald_dds.RData"))
+model <- readRDS(file=paste0(objects_dir, "/all_wald_model.RData"))
+
+# Define contrasts
+comparisons <- list(
+  FEMinoc24_vs_FEMctrl24 = c("FEM_inoculated_24", "FEM_control_24"), # FEM inoculated v. FEM control
+  FEMinoc48_vs_FEMctrl24 = c("FEM_inoculated_48", "FEM_control_24"),
+  FEMinoc72_vs_FEMctrl24 = c("FEM_inoculated_72", "FEM_control_24"),
+  
+  `201inoc24_vs_201ctrl24` = c("201_inoculated_24", "201_control_24"), # 201 inoculated v. 201 control
+  `201inoc48_vs_201ctrl24` = c("201_inoculated_48", "201_control_24"),
+  `201inoc72_vs_201ctrl24` = c("201_inoculated_72", "201_control_24"),
+  
+  FEMinoc24_vs_201inoc24 = c("FEM_inoculated_24", "201_inoculated_24"), # FEM inoculated v. 201 inoculated
+  FEMinoc48_vs_201inoc48 = c("FEM_inoculated_48", "201_inoculated_48"),
+  FEMinoc72_vs_201inoc72 = c("FEM_inoculated_72", "201_inoculated_72")
+)
+
+# Store results
+res_list <- list()
+sig_list <- list()
+
+for (name in names(comparisons)) {
+  groups <- comparisons[[name]]
+  
+  # 1) Extract results for this contrast
+  res_all <- results(model, contrast = c("group", groups[1], groups[2]))
+  
+  # 2) Significant DEGs (padj < 0.05)
+  sig_all <- res_all[!is.na(res_all$padj) & res_all$padj < 0.05, ]
+  
+  # Store in lists
+  res_list[[name]] <- res_all
+  sig_list[[name]] <- sig_all
+  
+  # 3) Summary to console (customized per contrast name)
+  cat("\n==== Contrast:", name, "====\n")
+  cat("Total DEGs (padj < 0.05): ", nrow(sig_all), "\n", sep = "")
+  cat("Up (LFC > 1): ", sum(sig_all$log2FoldChange >  1, na.rm = TRUE), "\n", sep = "")
+  cat("Down (LFC < -1): ", sum(sig_all$log2FoldChange < -1, na.rm = TRUE), "\n", sep = "")
+  
+  # 4) Write CSV of significant DEGs
+  write.csv(
+    as.data.frame(sig_all),
+    file = file.path(results_dir, paste0("all_wald_DEGs_", name, ".csv")),
+    row.names = TRUE
+  )
+  
+  # 5) Save R objects
+  saveRDS(res_all, file = file.path(objects_dir, paste0("all_wald_res_", name, ".rds")))
+  saveRDS(sig_all, file = file.path(objects_dir, paste0("all_wald_DEGs_", name, ".rds")))
+}
+
+```
+
+```{r}
+# Extract interaction terms for paired contrasts
+dds <- readRDS(file=paste0(objects_dir, "/all_wald_dds.RData"))
+model <- readRDS(file=paste0(objects_dir, "/all_wald_model.RData"))
+
+# Define contrasts
+intersection_pairs <- list(
+  FEM_24 = c("FEMinoc24_vs_FEMctrl24", "FEMinoc24_vs_201inoc24"),
+  FEM_48 = c("FEMinoc48_vs_FEMctrl24", "FEMinoc48_vs_201inoc48"),
+  FEM_72 = c("FEMinoc72_vs_FEMctrl24", "FEMinoc72_vs_201inoc72")
+)
+
+for (nm in names(intersection_pairs)) {
+  compA <- intersection_pairs[[nm]][1]  # FEM vs FEM control
+  compB <- intersection_pairs[[nm]][2]  # FEM vs 201
+ 
+  # Genes significant in each comparison
+  genesA <- rownames(sig_list[[compA]])
+  genesB <- rownames(sig_list[[compB]])
+  
+  common_genes <- intersect(genesA, genesB)
+  
+  if (length(common_genes) == 0) {
+    cat("\nNo overlapping DEGs for", nm, "\n")
+    next
+  }
+  
+  # Build a small summary data.frame for the intersection
+  df <- data.frame(
+    gene        = common_genes,
+    log2FC_FEM_vs_ctrl = sig_list[[compA]][common_genes, "log2FoldChange"],
+    padj_FEM_vs_ctrl   = sig_list[[compA]][common_genes, "padj"],
+    log2FC_FEM_vs_201  = sig_list[[compB]][common_genes, "log2FoldChange"],
+    padj_FEM_vs_201    = sig_list[[compB]][common_genes, "padj"],
+    stringsAsFactors = FALSE
+  )
+  
+  # Optional: classify direction of regulation for FEM
+  df$direction <- NA_character_
+  
+  # Here, positive log2FC means "higher in FEM" because FEM is the first level 
+  # in each contrast c("group", FEM_inoculated_X, comparator)
+  df$direction[df$log2FC_FEM_vs_ctrl > 0 & df$log2FC_FEM_vs_201 > 0] <- "FEM_up_vs_both"
+  df$direction[df$log2FC_FEM_vs_ctrl < 0 & df$log2FC_FEM_vs_201 < 0] <- "FEM_down_vs_both"
+  df$direction[df$log2FC_FEM_vs_ctrl > 0 & df$log2FC_FEM_vs_201 < 0] <- "FEM_up_vs_ctrl_down_vs_201"
+  df$direction[df$log2FC_FEM_vs_ctrl < 0 & df$log2FC_FEM_vs_201 > 0] <- "FEM_down_vs_ctrl_up_vs_201"
+  
+  # Store in list
+  intersection_pairs[[nm]] <- df
+  
+  # Write CSV
+  write.csv(
+    df,
+    file = file.path(results_dir, paste0("all_wald_DEGs_intersection_", nm, ".csv")),
+    row.names = FALSE
+  )
+  
+  cat("\n==== Intersection:", nm, "====\n")
+  cat("Overlapping DEGs: ", nrow(df), "\n", sep = "")
+  cat("FEM_up_vs_both:   ", sum(df$direction == "FEM_up_vs_both", na.rm = TRUE), "\n", sep = "")
+  cat("FEM_down_vs_both: ", sum(df$direction == "FEM_down_vs_both", na.rm = TRUE), "\n", sep = "")
+}
+```
+
+### PCA
+
+```{r}
+# PCA 3x1
+dds <- readRDS(file=paste0(objects_dir, "/all_wald_dds.RData"))
+model <- readRDS(file=paste0(objects_dir, "/all_wald_model.RData"))
+log2fc_thresholds <- c(0, 1, 2)
+vsd <- vst(model, blind =FALSE)
+expr_mat <- assay(vsd)
+pca_res <- prcomp(t(expr_mat), scale. = TRUE)
+variance_explained <- pca_res$sdev^2 / sum(pca_res$sdev^2) * 100
+pc1_var <- round(variance_explained[1], 1)
+pc2_var <- round(variance_explained[2], 1)
+pc3_var <- round(variance_explained[3], 1)
+pc4_var <- round(variance_explained[4], 1)
+
+# Create PCA dataframe and include variables for coloring
+pca_df <- data.frame(PC1 = pca_res$x[, 1], 
+                     PC2 = pca_res$x[, 2],
+                     PC3 = pca_res$x[, 3],
+                     PC4 = pca_res$x[, 4],
+                     variety = colData(vsd)$Variety,
+                     time = colData(vsd)$Time,
+                     treatment = colData(vsd)$Treatment
+                     )
+
+# Plot
+base_theme <- theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    axis.title = element_text(face = "bold", size = 13),
+    axis.text = element_text(color = "black", size = 11),
+    legend.position = "right",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11),
+    legend.key = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    plot.margin = margin(6, 8, 6, 6)
+  )
+
+make_pca_plot <- function(df, color_var, colors, title,
+                          show_x = FALSE, show_y = FALSE) {
+  
+  x_lab <- if (show_x) paste0("PC1 (", pc1_var, "%)") else NULL
+  y_lab <- if (show_y) paste0("PC2 (", pc2_var, "%)") else NULL
+  
+  ggplot(df, aes(x = PC1, y = PC2, color = {{ color_var }})) +
+    geom_point(size = 2.8, alpha = 0.9, stroke = 0.4) +
+    scale_color_manual(values = colors) +
+    labs(
+      title = title,
+      x = x_lab,
+      y = y_lab
+    ) +
+    base_theme +
+    theme(
+      axis.title.x = if (!show_x) element_blank() else element_text(),
+      axis.title.y = if (!show_y) element_blank() else element_text()
+    )
+}
+
+# Colors (unchanged)
+variety_colors <- c("201" = "#984EA3", "FEM" = "#1B9E77")
+time_colors <- c("24" = "#FDBF6F", "48" = "#FF7F00", "72" = "#B15928")
+treatment_colors <- c("control" = "#4D4D4D", "inoculated" = "#377EB8")
+
+## Plots in Figure 3 order
+p_time <- make_pca_plot(
+  pca_df, as.factor(time), time_colors,
+  "Hours post inoculation (hpi)",
+  show_x = FALSE, show_y = FALSE
+)
+
+p_treatment <- make_pca_plot(
+  pca_df, treatment, treatment_colors,
+  "Treatment",
+  show_x = FALSE, show_y = TRUE
+)
+
+p_variety <- make_pca_plot(
+  pca_df, variety, variety_colors,
+  "Variety",
+  show_x = TRUE, show_y = FALSE
+)
+
+# Combine in A-B-C order
+p_panel <- p_time / p_treatment / p_variety +
+  plot_annotation(tag_levels = "A")
+
+p_panel
+
+# Save
+ggsave(
+  paste0(results_dir, "/all_wald_PCA_3x1_panel.png"),
+  plot = p_panel,
+  width = 6.5,
+  height = 10,
+  dpi = 600,
+  bg = "white"
+)
+
+```
+
+## Model inoculated (Wald)
+
+The restriction of control libraries to one time point in the full model resulted in incomplete treatment × time contrasts. Thus this model retains only the inoculated samples.
+
+```{r}
+# Subset metadata and counts
+meta_inoc <- metadata[metadata$Treatment == "inoculated", ]
+counts_inoc <- filtered_counts[, colnames(filtered_counts) %in% meta_inoc$SampleName]
+meta_inoc <- meta_inoc[match(colnames(counts_inoc), meta_inoc$SampleName), ]
+all(meta_inoc$SampleName == colnames(counts_inoc))  
+
+```
+
+```{r}
+# Inoculated samples only model
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_inoc,
+  colData   = meta_inoc,
+  design    = ~ variety + time + variety:time
+)
+
+# Filter lowly expressed genes where 2 samples have > 10 counts
+keep <- rowSums(counts(dds) >= 10) >= 2
+dds <- dds[keep,]
+model <- DESeq(dds)
+
+# save dds result
+saveRDS(dds, file = paste0(objects_dir, "/inoculated_wald_dds.RData"))
+saveRDS(model, file = paste0(objects_dir, "/inoculated_wald_model.RData"))
+
+```
+
+
+```{r}
+# Summarize model results
+dds <- readRDS(file=paste0(objects_dir, "/inoculated_wald_dds.RData"))
+model <- readRDS(file=paste0(objects_dir, "/inoculated_wald_model.RData"))
+print(resultsNames(model))
+print(summary(results(model)))
+```
+
+
+```{r}
+# Plot dispersion
+dds <- readRDS(file=paste0(objects_dir, "/inoculated_wald_dds.RData"))
+model <- readRDS(file=paste0(objects_dir, "/inoculated_wald_model.RData"))
+plotDispEsts(model)
+attr(dispersionFunction(model), "coefficients")
+
+```
+
+
+### Extract DEGs
+
+```{r}
+# Extract interaction term
+dds <- readRDS(file=paste0(objects_dir, "/inoculated_wald_dds.RData"))
+model <- readRDS(file=paste0(objects_dir, "/inoculated_wald_model.RData"))
+
+# Define comparisons
+comparisons <- list(
+  FEMvs201_24 = list(type  = "name", value = "variety_FEM_vs_201"),
+  FEMvs201_48 = list(type  = "contrast", value = list(c("variety_FEM_vs_201", "varietyFEM.time48"))),
+  FEMvs201_72 = list(type  = "contrast", value = list(c("variety_FEM_vs_201", "varietyFEM.time72")))
+)
+
+# Store as list
+res_list <- list()
+sig_list <- list()
+
+# Loop over comparisons
+for (nm in names(comparisons)) {
+  cmp <- comparisons[[nm]]
+  
+  # --- Call DESeq2 results() for this contrast ---
+  if (cmp$type == "name") {
+    res_all <- results(model, name = cmp$value)
+  } else if (cmp$type == "contrast") {
+    res_all <- results(model, contrast = cmp$value)
+  } else {
+    stop("Unknown comparison type for: ", nm)
+  }
+  
+  # --- Significant DEGs ---
+  sig_all <- res_all[!is.na(res_all$padj) & res_all$padj < 0.05, ]
+  
+  # --- Store in lists ---
+  res_list[[nm]] <- res_all
+  sig_list[[nm]] <- sig_all
+  
+  # --- Console summary ---
+  cat("\n==== Contrast:", nm, "====\n")
+  cat("Total DEGs (padj < 0.05): ", nrow(sig_all), "\n", sep = "")
+  cat("Up (LFC > 1): ",  sum(sig_all$log2FoldChange >  1, na.rm = TRUE), "\n", sep = "")
+  cat("Down (LFC < -1): ", sum(sig_all$log2FoldChange < -1, na.rm = TRUE), "\n", sep = "")
+  
+  # --- Write CSV of significant DEGs ---
+  write.csv(
+    as.data.frame(sig_all),
+    file = file.path(results_dir, paste0("inoculated_wald_DEGs_", nm, ".csv")),
+    row.names = TRUE
+  )
+  
+  # --- Save R objects ---
+  saveRDS(res_all, file = file.path(objects_dir, paste0("inoculated_wald_res_", nm, ".rds")))
+  saveRDS(sig_all, file = file.path(objects_dir, paste0("inoculated_wald_DEGs_", nm, ".rds")))
+}
+```
+
+
+### PCA
+
+```{r}
+# PCA 3x1
+dds <- readRDS(file=paste0(objects_dir, "/inoculated_wald_dds.RData"))
+model <- readRDS(file=paste0(objects_dir, "/inoculated_wald_model.RData"))
+log2fc_thresholds <- c(0, 1, 2)
+vsd <- vst(model, blind =FALSE)
+expr_mat <- assay(vsd)
+pca_res <- prcomp(t(expr_mat), scale. = TRUE)
+variance_explained <- pca_res$sdev^2 / sum(pca_res$sdev^2) * 100
+pc1_var <- round(variance_explained[1], 1)
+pc2_var <- round(variance_explained[2], 1)
+pc3_var <- round(variance_explained[3], 1)
+pc4_var <- round(variance_explained[4], 1)
+
+# Create PCA dataframe and include variables for coloring
+pca_df <- data.frame(PC1 = pca_res$x[, 1], 
+                     PC2 = pca_res$x[, 2],
+                     PC3 = pca_res$x[, 3],
+                     PC4 = pca_res$x[, 4],
+                     variety = colData(vsd)$Variety,
+                     time = colData(vsd)$Time,
+                     treatment = colData(vsd)$Treatment
+                     )
+
+# Plot
+base_theme <- theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    axis.title = element_text(face = "bold", size = 13),
+    axis.text = element_text(color = "black", size = 11),
+    legend.position = "right",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11),
+    legend.key = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    plot.margin = margin(6, 8, 6, 6)
+  )
+
+make_pca_plot <- function(df, color_var, colors, title,
+                          show_x = FALSE, show_y = FALSE) {
+  
+  x_lab <- if (show_x) paste0("PC1 (", pc1_var, "%)") else NULL
+  y_lab <- if (show_y) paste0("PC2 (", pc2_var, "%)") else NULL
+  
+  ggplot(df, aes(x = PC1, y = PC2, color = {{ color_var }})) +
+    geom_point(size = 2.8, alpha = 0.9, stroke = 0.4) +
+    scale_color_manual(values = colors) +
+    labs(
+      title = title,
+      x = x_lab,
+      y = y_lab
+    ) +
+    base_theme +
+    theme(
+      axis.title.x = if (!show_x) element_blank() else element_text(),
+      axis.title.y = if (!show_y) element_blank() else element_text()
+    )
+}
+
+# Colors (unchanged)
+variety_colors <- c("201" = "#984EA3", "FEM" = "#1B9E77")
+time_colors <- c("24" = "#FDBF6F", "48" = "#FF7F00", "72" = "#B15928")
+treatment_colors <- c("control" = "#4D4D4D", "inoculated" = "#377EB8")
+
+# Plots in Figure 3 order
+p_time <- make_pca_plot(
+  pca_df, as.factor(time), time_colors,
+  "Hours post inoculation (hpi)",
+  show_x = FALSE, show_y = FALSE
+)
+
+p_treatment <- make_pca_plot(
+  pca_df, treatment, treatment_colors,
+  "Treatment",
+  show_x = FALSE, show_y = TRUE
+)
+
+p_variety <- make_pca_plot(
+  pca_df, variety, variety_colors,
+  "Variety",
+  show_x = TRUE, show_y = FALSE
+)
+
+# Combine in A-B-C order
+p_panel <- p_time / p_treatment / p_variety +
+  plot_annotation(tag_levels = "A")
+
+p_panel
+
+# Save
+ggsave(
+  paste0(results_dir, "/inoculated_wald_PCA_3x1_panel.png"),
+  plot = p_panel,
+  width = 6.5,
+  height = 10,
+  dpi = 600,
+  bg = "white"
+)
+
+```
+
+### Volcano plots
+
+```{r}
+# Plot volcano plots as panel
+
+# Define contrasts
+comparisons <- list(
+  FEMvs201_24 = list(type  = "name", value = "variety_FEM_vs_201"),
+  FEMvs201_48 = list(type  = "contrast", value = list(c("variety_FEM_vs_201", "varietyFEM.time48"))),
+  FEMvs201_72 = list(type  = "contrast", value = list(c("variety_FEM_vs_201", "varietyFEM.time72")))
+)
+
+layout_vec <- c("FEMvs201_24", "FEMvs201_48", "FEMvs201_72")
+
+pretty_titles <- c(
+  FEMvs201_24 = "24 hpi",
+  FEMvs201_48 = "48 hpi",
+  FEMvs201_72 = "72 hpi"
+)
+
+volcano_colors <- c(
+  "Upregulated genes"   = "#F4A7B9",
+  "Downregulated genes" = "#A7D3F4",
+  "Not Significant"     = "#D8D8D8"
+)
+
+plot_list <- vector("list", length(layout_vec))
+names(plot_list) <- layout_vec
+
+for (comp in layout_vec) {
+  
+  message("Processing: ", comp)
+  
+  res_file <- file.path(objects_dir, paste0("inoculated_wald_res_", comp, ".rds"))
+  res_treatment <- readRDS(res_file)
+  
+  res_df <- as.data.frame(res_treatment)
+  res_df <- res_df[!is.na(res_df$padj) & is.finite(res_df$log2FoldChange), ]
+  
+  res_df$significance <- "Not Significant"
+  res_df$significance[res_df$padj < 0.05 & res_df$log2FoldChange > 0] <- "Upregulated genes"
+  res_df$significance[res_df$padj < 0.05 & res_df$log2FoldChange < 0] <- "Downregulated genes"
+  
+  res_df$significance <- factor(
+    res_df$significance,
+    levels = c("Upregulated genes", "Downregulated genes", "Not Significant")
+  )
+  
+  c <- match(comp, layout_vec)
+  
+  x_lab <- if (c == 2) "log2 fold change" else NULL
+  y_lab <- if (c == 1) expression(-log[10]("adjusted p-value")) else NULL
+  
+  p <- ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj), color = significance)) +
+    geom_hline(yintercept = -log10(0.05), linewidth = 0.35, linetype = "dashed", color = "grey45") +
+    geom_vline(xintercept = 0, linewidth = 0.35, linetype = "dashed", color = "grey45") +
+    geom_point(alpha = 0.75, size = 1.8, stroke = 0) +
+    scale_color_manual(values = volcano_colors, drop = FALSE) +
+    labs(
+      title = pretty_titles[comp],
+      x = x_lab,
+      y = y_lab
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+      axis.title = element_text(face = "bold", size = 11),
+      axis.text = element_text(color = "black", size = 10),
+      axis.line = element_line(linewidth = 0.45),
+      axis.ticks = element_line(linewidth = 0.45),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.45),
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      legend.text = element_text(size = 10),
+      legend.key = element_blank(),
+      plot.margin = margin(6, 6, 6, 6)
+    )
+  
+  plot_list[[comp]] <- p
+}
+
+panel <- (plot_list[[layout_vec[1]]] |
+          plot_list[[layout_vec[2]]] |
+          plot_list[[layout_vec[3]]]) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+panel
+
+ggsave(
+  filename = file.path(results_dir, "inoculated_wald_volcano_1x3_panel.png"),
+  plot = panel,
+  width = 11,
+  height = 4,
+  dpi = 600,
+  bg = "white"
+)
+
+
+```
+
+### Blast
+```{r}
+# contrasts to loop
+labels <- c("FEMvs201_24", "FEMvs201_48", "FEMvs201_72")
+
+# set blastp filter parameters
+max_evalue        <- 1e-10
+min_pident        <- 40
+min_align_len_abs <- 100
+min_qcov          <- 0.50
+min_scov          <- 0.50
+
+# add blast ouput to DEGs
+for (label in labels) {
+
+  message("Processing: ", label)
+
+  # Load data
+  res_obj <- readRDS(file.path(objects_dir, paste0("inoculated_wald_res_",  label, ".rds")))
+  deg_obj <- readRDS(file.path(objects_dir, paste0("inoculated_wald_DEGs_", label, ".rds")))
+
+  # Convert DESeqResults to tibble
+  deg_tbl <- deg_obj %>%
+    as.data.frame() %>%
+    rownames_to_column(var = "gene")
+
+  # Annotate with blastp
+  deg_annotated <- deg_tbl %>%
+    left_join(blast_top, by = "gene") %>%
+    mutate(
+      evalue_num = suppressWarnings(as.numeric(evalue)),
+      aln_len    = dplyr::coalesce(length, (qend - qstart + 1L)),
+      qcov = if (all(c("qstart","qend","qlen") %in% names(cur_data_all()))) {
+        (qend - qstart + 1) / qlen
+      } else if (all(c("qstart","qend","query_len") %in% names(cur_data_all()))) {
+        (qend - qstart + 1) / query_len
+      } else NA_real_,
+      scov = if (all(c("sstart","send","slen") %in% names(cur_data_all()))) {
+        (abs(send - sstart) + 1) / slen
+      } else if (all(c("sstart","send","subject_len") %in% names(cur_data_all()))) {
+        (abs(send - sstart) + 1) / subject_len
+      } else NA_real_
+    )
+
+  # Export all annotated
+  write.csv(
+    deg_annotated,
+    file = file.path(results_dir, paste0("inoculated_wald_DEGs_", label, "_annotated.csv")),
+    row.names = FALSE
+  )
+
+  # Upregulated
+  deg_lfc1_up <- deg_annotated %>% filter(log2FoldChange > 1)
+  write.csv(
+    deg_lfc1_up,
+    file = file.path(results_dir, paste0("inoculated_wald_DEGs_", label, "_annotated_L2FC1_up.csv")),
+    row.names = FALSE
+  )
+
+  strong_blast_up <- deg_lfc1_up %>%
+    filter(
+      !is.na(pident), !is.na(evalue_num), !is.na(aln_len),
+      evalue_num <= max_evalue,
+      pident     >= min_pident,
+      if (!all(is.na(qcov))) qcov >= min_qcov else TRUE,
+      if (!all(is.na(scov))) scov >= min_scov else TRUE,
+      if (all(is.na(qcov)) && all(is.na(scov))) aln_len >= min_align_len_abs else TRUE
+    )
+  write.csv(
+    strong_blast_up,
+    file = file.path(results_dir, paste0("inoculated_wald_DEGs_", label, "_annotated_L2FC1_up_strong_blast.csv")),
+    row.names = FALSE
+  )
+
+  # Downregulated
+  deg_lfc1_down <- deg_annotated %>% filter(log2FoldChange < -1)
+  write.csv(
+    deg_lfc1_down,
+    file = file.path(results_dir, paste0("inoculated_wald_DEGs_", label, "_annotated_L2FC1_down.csv")),
+    row.names = FALSE
+  )
+
+  strong_blast_down <- deg_lfc1_down %>%
+    filter(
+      !is.na(pident), !is.na(evalue_num), !is.na(aln_len),
+      evalue_num <= max_evalue,
+      pident     >= min_pident,
+      if (!all(is.na(qcov))) qcov >= min_qcov else TRUE,
+      if (!all(is.na(scov))) scov >= min_scov else TRUE,
+      if (all(is.na(qcov)) && all(is.na(scov))) aln_len >= min_align_len_abs else TRUE
+    )
+  write.csv(
+    strong_blast_down,
+    file = file.path(results_dir, paste0("inoculated_wald_DEGs_", label, "_annotated_L2FC1_down_strong_blast.csv")),
+    row.names = FALSE
+  )
+
+  message("Finished: ", label)
+}
+
+
+```
+
+### GO
+
+```{r}
+# Plot GO plots as panel (3x1)
+
+layout_mat <- matrix(c("FEMvs201_24",
+                       "FEMvs201_48",
+                       "FEMvs201_72"),
+                     nrow = 3, byrow = TRUE)
+labels <- as.vector(layout_mat)
+
+go_plot_list <- vector("list", length = length(labels))
+names(go_plot_list) <- labels
+
+make_blank <- function(title_txt, msg = "Too few annotated DEGs\nwith GO terms") {
+  ggplot() +
+    annotate("text", x = 0, y = 0, label = msg) +
+    labs(title = title_txt) +
+    theme_void() +
+    theme(plot.title = element_text(size = 12, hjust = 0.5))
+}
+
+ont_list <- c("BP", "MF", "CC")
+
+for (label in labels) {
+  message("Processing ", label, " ...")
+
+  # -----------------------------
+  # Build background universe
+  # -----------------------------
+
+  res_obj <- readRDS(file.path(objects_dir, paste0("inoculated_wald_res_", label, ".rds")))
+
+  tested_genes <- res_obj %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("gene") %>%
+    dplyr::filter(!is.na(pvalue)) %>%
+    dplyr::pull(gene)
+
+  tested_annotated <- tibble::tibble(gene = tested_genes) %>%
+    dplyr::left_join(blast_top, by = "gene") %>%
+    dplyr::mutate(
+      uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+    ) %>%
+    dplyr::filter(
+      !is.na(subject),
+      subject != "",
+      !is.na(uniprot_id),
+      uniprot_id != ""
+    )
+
+  gene_universe <- unique(tested_annotated$uniprot_id)
+
+  gene2go_full <- goa %>%
+    dplyr::filter(UniProt_ID %in% gene_universe) %>%
+    dplyr::group_by(UniProt_ID) %>%
+    dplyr::summarise(go_terms = list(unique(GO_ID)), .groups = "drop") %>%
+    tibble::deframe()
+
+  gene_universe <- intersect(gene_universe, names(gene2go_full))
+
+  # -----------------------------
+  # Load foreground DEGs
+  # -----------------------------
+
+  deg_annotated <- read.csv(
+    file.path(results_dir, paste0("inoculated_wald_DEGs_", label, "_annotated.csv")),
+    header = TRUE,
+    stringsAsFactors = FALSE
+  )
+
+  deg_annotated <- deg_annotated %>%
+    dplyr::mutate(
+      uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+    )
+
+  deg_uniprot <- unique(na.omit(deg_annotated$uniprot_id))
+  deg_uniprot <- intersect(deg_uniprot, gene_universe)
+
+  deg_goa <- goa %>%
+    dplyr::filter(UniProt_ID %in% deg_uniprot)
+
+  if (nrow(deg_goa) < 10) {
+    go_plot_list[[label]] <- make_blank(label)
+    next
+  }
+
+  # -----------------------------
+  # Build topGO gene list
+  # -----------------------------
+
+  geneList <- factor(as.integer(gene_universe %in% deg_uniprot))
+  names(geneList) <- gene_universe
+  geneList <- factor(geneList, levels = c(0, 1))
+
+  # -----------------------------
+  # Run topGO
+  # -----------------------------
+
+  res_all <- list()
+
+  for (ont in ont_list) {
+    go_data <- new(
+      "topGOdata",
+      ontology = ont,
+      allGenes = geneList,
+      annot    = annFUN.gene2GO,
+      gene2GO  = gene2go_full
+    )
+
+    result <- suppressMessages(capture.output(
+      res <- runTest(go_data, algorithm = "weight01", statistic = "fisher"),
+      file = NULL
+    ))
+    result <- res
+
+    res_table <- GenTable(
+      go_data,
+      weight01  = result,
+      ranksOf   = "weight01",
+      useLevels = TRUE
+    )
+
+    res_table$Ontology <- ont
+    res_all[[ont]] <- res_table
+  }
+
+  all_results <- dplyr::bind_rows(res_all)
+  all_results$weight01 <- as.numeric(all_results$weight01)
+
+  sig_results <- all_results %>%
+    dplyr::filter(weight01 < 0.05) %>%
+    dplyr::group_by(Ontology) %>%
+    dplyr::slice_min(order_by = weight01, n = 8, with_ties = FALSE) %>% # show up to 8 terms per ontology (24 max)
+    dplyr::ungroup()
+
+  if (nrow(sig_results) == 0) {
+    go_plot_list[[label]] <- make_blank(label, "No significant GO terms")
+    next
+  }
+
+  idx <- which(layout_mat == label, arr.ind = TRUE)
+  r <- idx[1]
+
+  # -----------------------------
+  # Plot
+  # -----------------------------
+
+  p <- ggplot(sig_results, aes(
+    x     = Significant,
+    y     = reorder(Term, -Significant),
+    color = Ontology,
+    size  = -log10(weight01)
+  )) +
+    geom_point() +
+    scale_color_manual(values = c(BP = "#A6CEE3", MF = "#FDBF6F", CC = "#B2DF8A")) +
+    guides(size = "none") +
+    labs(
+      title = label,
+      x = if (r == 3) "Number of Genes" else NULL,
+      y = "GO Term"
+    ) +
+    cowplot::theme_cowplot(font_size = 8) +
+    theme(
+      axis.text.x  = element_text(size = 8),
+      axis.text.y  = element_text(size = 8),
+      axis.title.x = element_text(size = 8),
+      axis.title.y = element_text(size = 8),
+      plot.title   = element_text(size = 9, hjust = 0.5),
+      legend.position = "none",
+      plot.margin = margin(4, 4, 4, 4)
+    )
+
+  go_plot_list[[label]] <- p
+}
+
+go_panel <-
+  go_plot_list[[layout_mat[1,1]]] /
+  go_plot_list[[layout_mat[2,1]]] /
+  go_plot_list[[layout_mat[3,1]]] +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8)
+  )
+
+ggsave(
+  filename = file.path(results_dir, "inoculated_wald_GO_3x1_panel.png"),
+  plot     = go_panel,
+  width    = 6.5,
+  height   = 9,
+  units    = "in",
+  dpi      = 600,
+  bg       = "white"
+)
+
+```
+
+
+#### 'defense response' 24h
+```{r}
+# pull gene names from the relevant GO category
+res_treatment  <- readRDS(file.path(objects_dir, "inoculated_wald_res_FEMvs201_24.rds"))
+DEGs_treatment <- readRDS(file.path(objects_dir, "inoculated_wald_DEGs_FEMvs201_24.rds"))
+target_go <- c("GO:0006952", "GO:0042742")
+go_tag <- paste(gsub(":", "", target_go), collapse = "_")
+label <- "defense_response_24h"  
+
+# if DEGs_treatment is now a single DESeqResults / data.frame (not a list):
+deg <- DEGs_treatment |>
+  as.data.frame() |>
+  tibble::rownames_to_column("gene")
+
+deg_annot <- deg |>
+  dplyr::left_join(blast_top, by = "gene") |>
+  dplyr::mutate(
+    uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+  )
+
+# which UniProt IDs are annotated with the target GO
+u_with_targetGO <- goa |>
+  dplyr::filter(GO_ID %in% target_go) |>
+  dplyr::pull(UniProt_ID) |>
+  unique()
+
+# keep only relevant genes whose UniProt has the target GO
+genes <- deg_annot |>
+  dplyr::filter(!is.na(uniprot_id) & uniprot_id %in% u_with_targetGO) |>
+  dplyr::select(
+    gene, log2FoldChange, padj,
+    uniprot_id, subject, pident, evalue, qstart, qend, sstart, send, description
+  ) |>
+  dplyr::arrange(dplyr::desc(log2FoldChange))
+
+print(genes)
+
+# write to disk (label instead of tp_key)
+write.csv(
+  genes,
+  file.path(results_dir, paste0("inoculated_wald_", go_tag, "_", label, "_L2FC1.csv")),
+  row.names = FALSE
+)
+```
+
+#### 'defense response to other organism' 72h
+```{r}
+# pull gene names from the relevant GO category
+res_treatment  <- readRDS(file.path(objects_dir, "inoculated_wald_res_FEMvs201_72.rds"))
+DEGs_treatment <- readRDS(file.path(objects_dir, "inoculated_wald_DEGs_FEMvs201_72.rds"))
+target_go <- "GO:0098542"
+go_tag <- paste(gsub(":", "", target_go), collapse = "_")
+label <- "defense_response_72h"  
+
+# if DEGs_treatment is now a single DESeqResults / data.frame (not a list):
+deg <- DEGs_treatment |>
+  as.data.frame() |>
+  tibble::rownames_to_column("gene")
+
+deg_annot <- deg |>
+  dplyr::left_join(blast_top, by = "gene") |>
+  dplyr::mutate(
+    uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+  )
+
+# which UniProt IDs are annotated with the target GO
+u_with_targetGO <- goa |>
+  dplyr::filter(GO_ID %in% target_go) |>
+  dplyr::pull(UniProt_ID) |>
+  unique()
+
+# keep only relevant genes whose UniProt has the target GO
+genes <- deg_annot |>
+  dplyr::filter(!is.na(uniprot_id) & uniprot_id %in% u_with_targetGO) |>
+  dplyr::select(
+    gene, log2FoldChange, padj,
+    uniprot_id, subject, pident, evalue, qstart, qend, sstart, send, description
+  ) |>
+  dplyr::arrange(dplyr::desc(log2FoldChange))
+
+print(genes)
+
+# write to disk (label instead of tp_key)
+write.csv(
+  genes,
+  file.path(results_dir, paste0("inoculated_wald_", go_tag, "_", label, "_L2FC1.csv")),
+  row.names = FALSE
+)
+```
+
+#### 'immune response' 48h
+```{r}
+# pull gene names from the relevant GO category
+res_treatment  <- readRDS(file.path(objects_dir, "inoculated_wald_res_FEMvs201_48.rds"))
+DEGs_treatment <- readRDS(file.path(objects_dir, "inoculated_wald_DEGs_FEMvs201_48.rds"))
+target_go <- "GO:0006955"
+go_tag <- paste(gsub(":", "", target_go), collapse = "_")
+label <- "immune_response_48h"  
+
+# if DEGs_treatment is now a single DESeqResults / data.frame (not a list):
+deg <- DEGs_treatment |>
+  as.data.frame() |>
+  tibble::rownames_to_column("gene")
+
+deg_annot <- deg |>
+  dplyr::left_join(blast_top, by = "gene") |>
+  dplyr::mutate(
+    uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+  )
+
+# which UniProt IDs are annotated with the target GO
+u_with_targetGO <- goa |>
+  dplyr::filter(GO_ID %in% target_go) |>
+  dplyr::pull(UniProt_ID) |>
+  unique()
+
+# keep only relevant genes whose UniProt has the target GO
+genes <- deg_annot |>
+  dplyr::filter(!is.na(uniprot_id) & uniprot_id %in% u_with_targetGO) |>
+  dplyr::select(
+    gene, log2FoldChange, padj,
+    uniprot_id, subject, pident, evalue, qstart, qend, sstart, send, description
+  ) |>
+  dplyr::arrange(dplyr::desc(log2FoldChange))
+
+print(genes)
+
+# write to disk (label instead of tp_key)
+write.csv(
+  genes,
+  file.path(results_dir, paste0("inoculated_wald_", go_tag, "_", label, "_L2FC1.csv")),
+  row.names = FALSE
+)
+```
+
+
+### GO (up only)
+```{r}
+# Loop over contrasts
+labels <- c("FEMvs201_24", "FEMvs201_48", "FEMvs201_72")
+ont_list <- c("BP", "MF", "CC")
+
+for (label in labels) {
+  message("Processing UP only: ", label, " ...")
+
+  # -----------------------------
+  # Build background universe
+  # -----------------------------
+
+  res_obj <- readRDS(file.path(objects_dir, paste0("inoculated_wald_res_", label, ".rds")))
+
+  tested_genes <- res_obj %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("gene") %>%
+    dplyr::filter(!is.na(pvalue)) %>%
+    dplyr::pull(gene)
+
+  tested_annotated <- tibble::tibble(gene = tested_genes) %>%
+    dplyr::left_join(blast_top, by = "gene") %>%
+    dplyr::mutate(
+      uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+    ) %>%
+    dplyr::filter(
+      !is.na(subject),
+      subject != "",
+      !is.na(uniprot_id),
+      uniprot_id != ""
+    )
+
+  gene_universe <- unique(tested_annotated$uniprot_id)
+
+  gene2go_full <- goa %>%
+    dplyr::filter(UniProt_ID %in% gene_universe) %>%
+    dplyr::group_by(UniProt_ID) %>%
+    dplyr::summarise(go_terms = list(unique(GO_ID)), .groups = "drop") %>%
+    tibble::deframe()
+
+  gene_universe <- intersect(gene_universe, names(gene2go_full))
+
+  # -----------------------------
+  # Load upregulated DEGs
+  # -----------------------------
+
+  in_file <- file.path(results_dir, paste0("inoculated_wald_DEGs_", label, "_annotated_L2FC1_up.csv"))
+
+  if (!file.exists(in_file)) {
+    message("  Missing file: ", in_file, " — skipping")
+    next
+  }
+
+  deg_up <- read.csv(in_file, header = TRUE, stringsAsFactors = FALSE)
+
+  deg_up <- deg_up %>%
+    dplyr::mutate(
+      uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+    )
+
+  deg_uniprot <- unique(na.omit(deg_up$uniprot_id))
+  deg_uniprot <- intersect(deg_uniprot, gene_universe)
+
+  deg_goa <- goa %>%
+    dplyr::filter(UniProt_ID %in% deg_uniprot)
+
+  if (nrow(deg_goa) < 10) {
+    message("  ", label, ": Too few upregulated DEGs with GO terms — skipping GO")
+    next
+  }
+
+  # -----------------------------
+  # Build topGO gene list
+  # -----------------------------
+
+  geneList <- factor(as.integer(gene_universe %in% deg_uniprot))
+  names(geneList) <- gene_universe
+  geneList <- factor(geneList, levels = c(0, 1))
+
+  # -----------------------------
+  # Run topGO
+  # -----------------------------
+
+  res_all <- list()
+
+  for (ont in ont_list) {
+    go_data <- new(
+      "topGOdata",
+      ontology = ont,
+      allGenes = geneList,
+      annot    = annFUN.gene2GO,
+      gene2GO  = gene2go_full
+    )
+
+    result <- suppressMessages(capture.output(
+      res <- runTest(go_data, algorithm = "weight01", statistic = "fisher"),
+      file = NULL
+    ))
+    result <- res
+
+    res_table <- GenTable(
+      go_data,
+      weight01  = result,
+      ranksOf   = "weight01",
+      useLevels = TRUE
+    )
+
+    res_table$Ontology <- ont
+    res_all[[ont]] <- res_table
+  }
+
+  all_results <- dplyr::bind_rows(res_all)
+  all_results$weight01 <- as.numeric(all_results$weight01)
+
+  sig_results <- all_results %>%
+    dplyr::filter(weight01 < 0.05)
+
+  if (nrow(sig_results) == 0) {
+    message("  ", label, ": No significant GO terms")
+    next
+  }
+
+  write.csv(
+    sig_results,
+    file = file.path(results_dir, paste0("inoculated_wald_GO_terms_", label, "_enriched_up.csv")),
+    row.names = FALSE
+  )
+
+  # -----------------------------
+  # Add GO info back to up DEG table
+  # -----------------------------
+
+  all_go_by_uniprot <- deg_goa %>%
+    dplyr::distinct(UniProt_ID, GO_ID) %>%
+    dplyr::group_by(UniProt_ID) %>%
+    dplyr::summarise(
+      all_go_ids = paste(sort(unique(GO_ID)), collapse = ";"),
+      .groups = "drop"
+    )
+
+  sig_go <- sig_results %>%
+    dplyr::transmute(
+      GO_ID     = GO.ID,
+      GO_Term   = Term,
+      Ontology  = Ontology,
+      go_p      = weight01,
+      n_sig_deg = Significant
+    )
+
+  deg_enriched_go_long <- deg_goa %>%
+    dplyr::distinct(UniProt_ID, GO_ID) %>%
+    dplyr::inner_join(sig_go, by = "GO_ID")
+
+  enriched_by_uniprot <- deg_enriched_go_long %>%
+    dplyr::group_by(UniProt_ID) %>%
+    dplyr::summarise(
+      enriched_go_ids  = paste(sort(unique(GO_ID)), collapse = ";"),
+      enriched_terms   = paste(sort(unique(GO_Term)), collapse = ";"),
+      enriched_onts    = paste(sort(unique(Ontology)), collapse = ";"),
+      n_enriched_terms = dplyr::n_distinct(GO_ID),
+      best_go_p        = min(go_p, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  deg_with_go <- deg_up %>%
+    dplyr::left_join(all_go_by_uniprot, by = c("uniprot_id" = "UniProt_ID")) %>%
+    dplyr::left_join(enriched_by_uniprot, by = c("uniprot_id" = "UniProt_ID")) %>%
+    dplyr::mutate(
+      all_go_ids       = ifelse(is.na(all_go_ids), "", all_go_ids),
+      enriched_go_ids  = ifelse(is.na(enriched_go_ids), "", enriched_go_ids),
+      enriched_terms   = ifelse(is.na(enriched_terms), "", enriched_terms),
+      enriched_onts    = ifelse(is.na(enriched_onts), "", enriched_onts),
+      n_enriched_terms = ifelse(is.na(n_enriched_terms), 0, n_enriched_terms)
+    )
+
+  write.csv(
+    deg_with_go,
+    file = file.path(results_dir, paste0("inoculated_wald_GO_DEGs_", label, "_up_terms.csv")),
+    row.names = FALSE,
+    quote = TRUE
+  )
+
+  # -----------------------------
+  # Plot
+  # -----------------------------
+
+  p <- ggplot2::ggplot(sig_results, ggplot2::aes(
+    x     = Significant,
+    y     = reorder(Term, -Significant),
+    color = Ontology,
+    size  = -log10(weight01)
+  )) +
+    ggplot2::geom_point() +
+    ggplot2::scale_color_manual(values = c(BP = "#A6CEE3", MF = "#FDBF6F", CC = "#B2DF8A")) +
+    ggplot2::labs(x = "Number of Genes", y = NULL) +
+    cowplot::theme_cowplot() +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = 90, hjust = 1),
+      plot.title  = ggplot2::element_text(size = 12)
+    )
+
+  ggplot2::ggsave(
+    file.path(results_dir, paste0("inoculated_wald_GO_DEGs_", label, "_up.png")),
+    plot   = p,
+    width  = 10,
+    height = 6,
+    dpi    = 300,
+    bg     = "white"
+  )
+}
+```
+
+```{r}
+# Plot GO plots as panel for up only
+
+# 1x3 layout order
+layout_mat <- matrix(c("FEMvs201_24",
+                       "FEMvs201_48",
+                       "FEMvs201_72"),
+                     nrow = 3, byrow = TRUE)
+labels <- as.vector(layout_mat)
+
+go_plot_list <- vector("list", length = length(labels))
+names(go_plot_list) <- labels
+
+make_blank <- function(title_txt, msg = "Too few upregulated DEGs\nwith GO terms") {
+  ggplot() +
+    annotate("text", x = 0, y = 0, label = msg) +
+    labs(title = title_txt) +
+    theme_void() +
+    theme(plot.title = element_text(size = 12, hjust = 0.5))
+}
+
+ont_list <- c("BP", "MF", "CC")
+
+for (label in labels) {
+  message("Processing UP panel: ", label, " ...")
+
+  # Build background universe from DESeq2-tested genes
+  res_obj <- readRDS(file.path(objects_dir, paste0("inoculated_wald_res_", label, ".rds")))
+
+  tested_genes <- res_obj %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("gene") %>%
+    dplyr::filter(!is.na(pvalue)) %>%
+    dplyr::pull(gene)
+
+  tested_annotated <- tibble::tibble(gene = tested_genes) %>%
+    dplyr::left_join(blast_top, by = "gene") %>%
+    dplyr::mutate(
+      uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+    ) %>%
+    dplyr::filter(
+      !is.na(subject),
+      subject != "",
+      !is.na(uniprot_id),
+      uniprot_id != ""
+    )
+
+  gene_universe <- unique(tested_annotated$uniprot_id)
+
+  gene2go_full <- goa %>%
+    dplyr::filter(UniProt_ID %in% gene_universe) %>%
+    dplyr::group_by(UniProt_ID) %>%
+    dplyr::summarise(go_terms = list(unique(GO_ID)), .groups = "drop") %>%
+    tibble::deframe()
+
+  gene_universe <- intersect(gene_universe, names(gene2go_full))
+
+  # Load upregulated DEGs
+  in_file <- file.path(results_dir, paste0("inoculated_wald_DEGs_", label, "_annotated_L2FC1_up.csv"))
+
+  if (!file.exists(in_file)) {
+    go_plot_list[[label]] <- make_blank(label, "Missing upregulated DEG file")
+    next
+  }
+
+  deg_annotated <- read.csv(in_file, header = TRUE, stringsAsFactors = FALSE)
+
+  deg_annotated <- deg_annotated %>%
+    dplyr::mutate(
+      uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+    )
+
+  deg_uniprot <- unique(na.omit(deg_annotated$uniprot_id))
+  deg_uniprot <- intersect(deg_uniprot, gene_universe)
+
+  deg_goa <- goa %>%
+    dplyr::filter(UniProt_ID %in% deg_uniprot)
+
+  if (nrow(deg_goa) < 10) {
+    go_plot_list[[label]] <- make_blank(label)
+    next
+  }
+
+  geneList <- factor(as.integer(gene_universe %in% deg_uniprot))
+  names(geneList) <- gene_universe
+  geneList <- factor(geneList, levels = c(0, 1))
+
+  res_all <- list()
+
+  for (ont in ont_list) {
+    go_data <- new(
+      "topGOdata",
+      ontology = ont,
+      allGenes = geneList,
+      annot    = annFUN.gene2GO,
+      gene2GO  = gene2go_full
+    )
+
+    result <- suppressMessages(capture.output(
+      res <- runTest(go_data, algorithm = "weight01", statistic = "fisher"),
+      file = NULL
+    ))
+    result <- res
+
+    res_table <- GenTable(
+      go_data,
+      weight01  = result,
+      ranksOf   = "weight01",
+      useLevels = TRUE
+    )
+
+    res_table$Ontology <- ont
+    res_all[[ont]] <- res_table
+  }
+
+  all_results <- dplyr::bind_rows(res_all)
+  all_results$weight01 <- as.numeric(all_results$weight01)
+
+  sig_results <- all_results %>%
+    dplyr::filter(weight01 < 0.05) %>%
+    dplyr::group_by(Ontology) %>%
+    dplyr::slice_min(order_by = weight01, n = 8, with_ties = FALSE) %>% # show up to 8 terms per ontology (24 max)
+    dplyr::ungroup()
+
+  if (nrow(sig_results) == 0) {
+    go_plot_list[[label]] <- make_blank(label, "No significant GO terms")
+    next
+  }
+
+  idx <- which(layout_mat == label, arr.ind = TRUE)
+  r <- idx[1]
+  
+  p <- ggplot(sig_results, aes(
+    x     = Significant,
+    y     = reorder(Term, -Significant),
+    color = Ontology,
+    size  = -log10(weight01)
+  )) +
+    geom_point() +
+    scale_color_manual(values = c(BP = "#A6CEE3", MF = "#FDBF6F", CC = "#B2DF8A")) +
+    guides(size = "none") +
+    labs(
+      title = label,
+      x = if (r == 3) "Number of Genes" else NULL,
+      y = "GO Term"
+    ) +
+    cowplot::theme_cowplot(font_size = 8) +
+    theme(
+      axis.text.x  = element_text(size = 8),
+      axis.text.y  = element_text(size = 8),
+      axis.title.x = element_text(size = 8),
+      axis.title.y = element_text(size = 8),
+      plot.title   = element_text(size = 9, hjust = 0.5),
+      legend.position = "none",
+      plot.margin = margin(4, 4, 4, 4)
+    )
+
+  go_plot_list[[label]] <- p
+}
+
+go_panel <-
+  go_plot_list[[layout_mat[1,1]]] /
+  go_plot_list[[layout_mat[2,1]]] /
+  go_plot_list[[layout_mat[3,1]]] +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8)
+  )
+
+ggsave(
+  filename = file.path(results_dir, "inoculated_wald_GO_3x1_panel_up.png"),
+  plot     = go_panel,
+  width    = 6.5,
+  height   = 9,
+  units    = "in",
+  dpi      = 600,
+  bg       = "white"
+)
+
+
+```
+
+#### 'defense response to other organism' 72h
+```{r}
+# pull gene names from the relevant GO category
+res_treatment  <- readRDS(file.path(objects_dir, "inoculated_wald_res_FEMvs201_72.rds"))
+DEGs_treatment <- readRDS(file.path(objects_dir, "inoculated_wald_DEGs_FEMvs201_72.rds"))
+target_go <- "GO:0098542"
+go_tag <- paste(gsub(":", "", target_go), collapse = "_")
+label <- "defense_response_72h_up"  
+
+# if DEGs_treatment is now a single DESeqResults / data.frame (not a list):
+deg <- DEGs_treatment |>
+  as.data.frame() |>
+  tibble::rownames_to_column("gene")
+
+# Keep upregulated only
+deg_up <- deg |>
+  dplyr::filter(!is.na(log2FoldChange), log2FoldChange >= 1, !is.na(padj), padj < 0.05)
+
+deg_annot <- deg_up |>
+  dplyr::left_join(blast_top, by = "gene") |>
+  dplyr::mutate(
+    uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+  )
+
+# which UniProt IDs are annotated with the target GO
+u_with_targetGO <- goa |>
+  dplyr::filter(GO_ID %in% target_go) |>
+  dplyr::pull(UniProt_ID) |>
+  unique()
+
+# keep only relevant genes whose UniProt has the target GO
+genes <- deg_annot |>
+  dplyr::filter(!is.na(uniprot_id) & uniprot_id %in% u_with_targetGO) |>
+  dplyr::select(
+    gene, log2FoldChange, padj,
+    uniprot_id, subject, pident, evalue, qstart, qend, sstart, send, description
+  ) |>
+  dplyr::arrange(dplyr::desc(log2FoldChange))
+
+print(genes)
+
+# write to disk (label instead of tp_key)
+write.csv(
+  genes,
+  file.path(results_dir, paste0("inoculated_wald_", go_tag, "_", label, "_L2FC1.csv")),
+  row.names = FALSE
+)
+```
+
+
+#### Candidate R gene exploration
+
+##### Defense response FEMvs201_72_up
+
+```{r}
+# Plot expression of GO:0098542-enriched DEGs (defense response) over time by variety
+dds   <- readRDS(file = file.path(objects_dir, "inoculated_wald_dds.RData"))
+model <- readRDS(file = file.path(objects_dir, "inoculated_wald_model.RData"))
+DEGs  <- read.csv(file.path(results_dir, "inoculated_wald_GO_DEGs_FEMvs201_72_up_terms.csv"),
+                  header = TRUE, stringsAsFactors = FALSE)
+go_tag <- "GO:0098542"
+label  <- "defense_response_72h_up"
+
+genes_of_interest <- DEGs %>%
+  filter(!is.na(enriched_go_ids)) %>%
+  filter(str_detect(enriched_go_ids, paste0("(^|;)", go_tag, "(;|$)"))) %>%
+  pull(gene) %>%
+  unique()
+
+vsd <- vst(dds, blind = FALSE)
+
+vsd_mat <- assay(vsd) %>%
+  as.data.frame() %>%
+  rownames_to_column("gene")
+
+meta <- as.data.frame(colData(dds))
+
+expr_long <- vsd_mat %>%
+  filter(gene %in% genes_of_interest) %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "expression") %>%
+  left_join(meta %>% rownames_to_column("sample"), by = "sample")
+
+
+blast_top_labels <- blast_top %>%
+  mutate(
+    short_desc = sub(" OS=.*", "", description),
+    label_desc = str_wrap(short_desc, width = 22),
+    label_desc_gene = paste0(label_desc, "\n", gene)
+  ) %>%
+  dplyr::select(gene, label_desc, label_desc_gene)
+
+# Join labels
+expr_long_labeled <- expr_long %>%
+  left_join(blast_top_labels, by = "gene") %>%
+  mutate(
+    label_desc = coalesce(label_desc, gene),
+    label_desc_gene = coalesce(label_desc_gene, gene)
+  )
+
+# Add indexed labels
+label_index <- expr_long_labeled %>%
+  distinct(gene, label_desc) %>%
+  group_by(label_desc) %>%
+  arrange(gene, .by_group = TRUE) %>%
+  mutate(
+    label_desc_indexed = if (n() > 1) {
+      paste0(label_desc, " (", row_number(), ")")
+    } else {
+      label_desc
+    }
+  ) %>%
+  ungroup() %>%
+  dplyr::select(gene, label_desc_indexed)
+
+expr_long_labeled <- expr_long_labeled %>%
+  left_join(label_index, by = "gene")
+
+stopifnot("label_desc" %in% names(expr_long_labeled))
+
+colors <- c(
+  "201" = "#984EA3",
+  "FEM" = "#1B9E77"
+)
+
+x_axis_time <- scale_x_continuous(
+  breaks = c(1, 2, 3),
+  labels = c("24", "48", "72"),
+  expand = expansion(mult = c(0.04, 0.04))
+)
+
+pub_theme <- theme_bw(base_size = 9) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.2),
+
+    strip.text = element_text(size = 6.8, face = "bold", lineheight = 0.9),
+    strip.background = element_rect(fill = "grey95", color = NA),
+
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    axis.text.x = element_text(size = 7.5),
+
+    legend.position = "bottom",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    legend.key.width = unit(1.0, "cm"),
+
+    panel.spacing.x = unit(0.45, "lines"),
+    panel.spacing.y = unit(0.6, "lines"),
+
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+# Portrait printable area on 8.5 x 11 paper with 1-inch margins = 6.5 x 9
+fig_width  <- 6.5
+fig_height <- 9
+
+# ---- Plot gene description-only ----
+p_desc <- ggplot(
+  expr_long_labeled,
+  aes(
+    x = time_numeric,
+    y = expression,
+    color = variety,
+    group = interaction(variety, sample)
+  )
+) +
+  geom_line(alpha = 0.22, linewidth = 0.25) +
+  geom_smooth(aes(group = variety), se = FALSE, linewidth = 0.8) +
+  facet_wrap(~ label_desc_indexed, nrow = 5) +
+  scale_color_manual(values = colors) +
+  x_axis_time +
+  guides(color = guide_legend(override.aes = list(linewidth = 1.8, alpha = 1))) +
+  labs(
+    x = "Hours post inoculation (hpi)",
+    y = "VST normalized expression",
+    color = "Variety"
+  ) +
+  pub_theme
+
+ggsave(
+  file.path(results_dir, paste0("inoculated_wald_", go_tag, "_", label, "_expression.png")),
+  plot = p_desc,
+  width = fig_width,
+  height = fig_height,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+# ---- Plot gene description + gene facets ----
+p_desc_gene <- ggplot(
+  expr_long_labeled,
+  aes(
+    x = time_numeric,
+    y = expression,
+    color = variety,
+    group = interaction(variety, sample)
+  )
+) +
+  geom_line(alpha = 0.22, linewidth = 0.25) +
+  geom_smooth(aes(group = variety), se = FALSE, linewidth = 0.8) +
+  facet_wrap(~ label_desc_gene, nrow = 5) +
+  scale_color_manual(values = colors) +
+  x_axis_time +
+  guides(color = guide_legend(override.aes = list(linewidth = 1.8, alpha = 1))) +
+  labs(
+    x = "Time post-inoculation (h)",
+    y = "VST normalized expression",
+    color = "Variety"
+  ) +
+  pub_theme
+
+ggsave(
+  file.path(results_dir, paste0("inoculated_wald_", go_tag, "_", label, "_expression_by_label.png")),
+  plot = p_desc_gene,
+  width = fig_width,
+  height = fig_height,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+
+
+### GO (down only)
+```{r}
+# Loop over contrasts
+labels <- c("FEMvs201_24", "FEMvs201_48", "FEMvs201_72")
+ont_list <- c("BP", "MF", "CC")
+
+for (label in labels) {
+  message("Processing down only: ", label, " ...")
+
+  # -----------------------------
+  # Build background universe
+  # -----------------------------
+
+  res_obj <- readRDS(file.path(objects_dir, paste0("inoculated_wald_res_", label, ".rds")))
+
+  tested_genes <- res_obj %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("gene") %>%
+    dplyr::filter(!is.na(pvalue)) %>%
+    dplyr::pull(gene)
+
+  tested_annotated <- tibble::tibble(gene = tested_genes) %>%
+    dplyr::left_join(blast_top, by = "gene") %>%
+    dplyr::mutate(
+      uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+    ) %>%
+    dplyr::filter(
+      !is.na(subject),
+      subject != "",
+      !is.na(uniprot_id),
+      uniprot_id != ""
+    )
+
+  gene_universe <- unique(tested_annotated$uniprot_id)
+
+  gene2go_full <- goa %>%
+    dplyr::filter(UniProt_ID %in% gene_universe) %>%
+    dplyr::group_by(UniProt_ID) %>%
+    dplyr::summarise(go_terms = list(unique(GO_ID)), .groups = "drop") %>%
+    tibble::deframe()
+
+  gene_universe <- intersect(gene_universe, names(gene2go_full))
+
+  # -----------------------------
+  # Load downregulated DEGs
+  # -----------------------------
+
+  in_file <- file.path(results_dir, paste0("inoculated_wald_DEGs_", label, "_annotated_L2FC1_down.csv"))
+
+  if (!file.exists(in_file)) {
+    message("  Missing file: ", in_file, " — skipping")
+    next
+  }
+
+  deg_down <- read.csv(in_file, header = TRUE, stringsAsFactors = FALSE)
+
+  deg_down <- deg_down %>%
+    dplyr::mutate(
+      uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+    )
+
+  deg_uniprot <- unique(na.omit(deg_down$uniprot_id))
+  deg_uniprot <- intersect(deg_uniprot, gene_universe)
+
+  deg_goa <- goa %>%
+    dplyr::filter(UniProt_ID %in% deg_uniprot)
+
+  if (nrow(deg_goa) < 10) {
+    message("  ", label, ": Too few downregulated DEGs with GO terms — skipping GO")
+    next
+  }
+
+  # -----------------------------
+  # Build topGO gene list
+  # -----------------------------
+
+  geneList <- factor(as.integer(gene_universe %in% deg_uniprot))
+  names(geneList) <- gene_universe
+  geneList <- factor(geneList, levels = c(0, 1))
+
+  # -----------------------------
+  # Run topGO
+  # -----------------------------
+
+  res_all <- list()
+
+  for (ont in ont_list) {
+    go_data <- new(
+      "topGOdata",
+      ontology = ont,
+      allGenes = geneList,
+      annot    = annFUN.gene2GO,
+      gene2GO  = gene2go_full
+    )
+
+    result <- suppressMessages(capture.output(
+      res <- runTest(go_data, algorithm = "weight01", statistic = "fisher"),
+      file = NULL
+    ))
+    result <- res
+
+    res_table <- GenTable(
+      go_data,
+      weight01  = result,
+      ranksOf   = "weight01",
+      useLevels = TRUE
+    )
+
+    res_table$Ontology <- ont
+    res_all[[ont]] <- res_table
+  }
+
+  all_results <- dplyr::bind_rows(res_all)
+  all_results$weight01 <- as.numeric(all_results$weight01)
+
+  sig_results <- all_results %>%
+    dplyr::filter(weight01 < 0.05)
+
+  if (nrow(sig_results) == 0) {
+    message("  ", label, ": No significant GO terms")
+    next
+  }
+
+  write.csv(
+    sig_results,
+    file = file.path(results_dir, paste0("inoculated_wald_GO_terms_", label, "_enriched_down.csv")),
+    row.names = FALSE
+  )
+
+  # -----------------------------
+  # Add GO info back to down DEG table
+  # -----------------------------
+
+  all_go_by_uniprot <- deg_goa %>%
+    dplyr::distinct(UniProt_ID, GO_ID) %>%
+    dplyr::group_by(UniProt_ID) %>%
+    dplyr::summarise(
+      all_go_ids = paste(sort(unique(GO_ID)), collapse = ";"),
+      .groups = "drop"
+    )
+
+  sig_go <- sig_results %>%
+    dplyr::transmute(
+      GO_ID     = GO.ID,
+      GO_Term   = Term,
+      Ontology  = Ontology,
+      go_p      = weight01,
+      n_sig_deg = Significant
+    )
+
+  deg_enriched_go_long <- deg_goa %>%
+    dplyr::distinct(UniProt_ID, GO_ID) %>%
+    dplyr::inner_join(sig_go, by = "GO_ID")
+
+  enriched_by_uniprot <- deg_enriched_go_long %>%
+    dplyr::group_by(UniProt_ID) %>%
+    dplyr::summarise(
+      enriched_go_ids  = paste(sort(unique(GO_ID)), collapse = ";"),
+      enriched_terms   = paste(sort(unique(GO_Term)), collapse = ";"),
+      enriched_onts    = paste(sort(unique(Ontology)), collapse = ";"),
+      n_enriched_terms = dplyr::n_distinct(GO_ID),
+      best_go_p        = min(go_p, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  deg_with_go <- deg_down %>%
+    dplyr::left_join(all_go_by_uniprot, by = c("uniprot_id" = "UniProt_ID")) %>%
+    dplyr::left_join(enriched_by_uniprot, by = c("uniprot_id" = "UniProt_ID")) %>%
+    dplyr::mutate(
+      all_go_ids       = ifelse(is.na(all_go_ids), "", all_go_ids),
+      enriched_go_ids  = ifelse(is.na(enriched_go_ids), "", enriched_go_ids),
+      enriched_terms   = ifelse(is.na(enriched_terms), "", enriched_terms),
+      enriched_onts    = ifelse(is.na(enriched_onts), "", enriched_onts),
+      n_enriched_terms = ifelse(is.na(n_enriched_terms), 0, n_enriched_terms)
+    )
+
+  write.csv(
+    deg_with_go,
+    file = file.path(results_dir, paste0("inoculated_wald_GO_DEGs_", label, "_down_terms.csv")),
+    row.names = FALSE,
+    quote = TRUE
+  )
+
+  # -----------------------------
+  # Plot
+  # -----------------------------
+
+  p <- ggplot2::ggplot(sig_results, ggplot2::aes(
+    x     = Significant,
+    y     = reorder(Term, -Significant),
+    color = Ontology,
+    size  = -log10(weight01)
+  )) +
+    ggplot2::geom_point() +
+    scale_color_manual(values = c(BP = "#A6CEE3", MF = "#FDBF6F", CC = "#B2DF8A")) +
+    ggplot2::labs(x = "Number of Genes", y = NULL) +
+    cowplot::theme_cowplot() +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = 90, hjust = 1),
+      plot.title  = ggplot2::element_text(size = 12)
+    )
+
+  ggplot2::ggsave(
+    file.path(results_dir, paste0("inoculated_wald_GO_DEGs_", label, "_down.png")),
+    plot   = p,
+    width  = 10,
+    height = 6,
+    dpi    = 300,
+    bg     = "white"
+  )
+}
+```
+
+```{r}
+# Plot GO plots as panel for down only
+
+# 1x3 layout order
+layout_mat <- matrix(c("FEMvs201_24",
+                       "FEMvs201_48",
+                       "FEMvs201_72"),
+                     nrow = 3, byrow = TRUE)
+labels <- as.vector(layout_mat)
+
+go_plot_list <- vector("list", length = length(labels))
+names(go_plot_list) <- labels
+
+make_blank <- function(title_txt, msg = "Too few downregulated DEGs\nwith GO terms") {
+  ggplot() +
+    annotate("text", x = 0, y = 0, label = msg) +
+    labs(title = title_txt) +
+    theme_void() +
+    theme(plot.title = element_text(size = 12, hjust = 0.5))
+}
+
+ont_list <- c("BP", "MF", "CC")
+
+for (label in labels) {
+  message("Processing down panel: ", label, " ...")
+
+  # Build background universe from DESeq2-tested genes
+  res_obj <- readRDS(file.path(objects_dir, paste0("inoculated_wald_res_", label, ".rds")))
+
+  tested_genes <- res_obj %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("gene") %>%
+    dplyr::filter(!is.na(pvalue)) %>%
+    dplyr::pull(gene)
+
+  tested_annotated <- tibble::tibble(gene = tested_genes) %>%
+    dplyr::left_join(blast_top, by = "gene") %>%
+    dplyr::mutate(
+      uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+    ) %>%
+    dplyr::filter(
+      !is.na(subject),
+      subject != "",
+      !is.na(uniprot_id),
+      uniprot_id != ""
+    )
+
+  gene_universe <- unique(tested_annotated$uniprot_id)
+
+  gene2go_full <- goa %>%
+    dplyr::filter(UniProt_ID %in% gene_universe) %>%
+    dplyr::group_by(UniProt_ID) %>%
+    dplyr::summarise(go_terms = list(unique(GO_ID)), .groups = "drop") %>%
+    tibble::deframe()
+
+  gene_universe <- intersect(gene_universe, names(gene2go_full))
+
+  # Load downregulated DEGs
+  in_file <- file.path(results_dir, paste0("inoculated_wald_DEGs_", label, "_annotated_L2FC1_down.csv"))
+
+  if (!file.exists(in_file)) {
+    go_plot_list[[label]] <- make_blank(label, "Missing downregulated DEG file")
+    next
+  }
+
+  deg_annotated <- read.csv(in_file, header = TRUE, stringsAsFactors = FALSE)
+
+  deg_annotated <- deg_annotated %>%
+    dplyr::mutate(
+      uniprot_id = sub("sp\\|([^|]+)\\|.*", "\\1", subject)
+    )
+
+  deg_uniprot <- unique(na.omit(deg_annotated$uniprot_id))
+  deg_uniprot <- intersect(deg_uniprot, gene_universe)
+
+  deg_goa <- goa %>%
+    dplyr::filter(UniProt_ID %in% deg_uniprot)
+
+  if (nrow(deg_goa) < 10) {
+    go_plot_list[[label]] <- make_blank(label)
+    next
+  }
+
+  geneList <- factor(as.integer(gene_universe %in% deg_uniprot))
+  names(geneList) <- gene_universe
+  geneList <- factor(geneList, levels = c(0, 1))
+
+  res_all <- list()
+
+  for (ont in ont_list) {
+    go_data <- new(
+      "topGOdata",
+      ontology = ont,
+      allGenes = geneList,
+      annot    = annFUN.gene2GO,
+      gene2GO  = gene2go_full
+    )
+
+    result <- suppressMessages(capture.output(
+      res <- runTest(go_data, algorithm = "weight01", statistic = "fisher"),
+      file = NULL
+    ))
+    result <- res
+
+    res_table <- GenTable(
+      go_data,
+      weight01  = result,
+      ranksOf   = "weight01",
+      useLevels = TRUE
+    )
+
+    res_table$Ontology <- ont
+    res_all[[ont]] <- res_table
+  }
+
+  all_results <- dplyr::bind_rows(res_all)
+  all_results$weight01 <- as.numeric(all_results$weight01)
+
+  sig_results <- all_results %>%
+    dplyr::filter(weight01 < 0.05) %>%
+    dplyr::group_by(Ontology) %>%
+    dplyr::slice_min(order_by = weight01, n = 8, with_ties = FALSE) %>% # show up to 8 terms per ontology (24 max)
+    dplyr::ungroup()
+
+  if (nrow(sig_results) == 0) {
+    go_plot_list[[label]] <- make_blank(label, "No significant GO terms")
+    next
+  }
+
+  idx <- which(layout_mat == label, arr.ind = TRUE)
+  r <- idx[1]
+  
+  p <- ggplot(sig_results, aes(
+    x     = Significant,
+    y     = reorder(Term, -Significant),
+    color = Ontology,
+    size  = -log10(weight01)
+  )) +
+    geom_point() +
+    scale_color_manual(values = c(BP = "#A6CEE3", MF = "#FDBF6F", CC = "#B2DF8A")) +
+    guides(size = "none") +
+    labs(
+      title = label,
+      x = if (r == 3) "Number of Genes" else NULL,
+      y = "GO Term"
+    ) +
+    cowplot::theme_cowplot(font_size = 8) +
+    theme(
+      axis.text.x  = element_text(size = 8),
+      axis.text.y  = element_text(size = 8),
+      axis.title.x = element_text(size = 8),
+      axis.title.y = element_text(size = 8),
+      plot.title   = element_text(size = 9, hjust = 0.5),
+      legend.position = "none",
+      plot.margin = margin(4, 4, 4, 4)
+    )
+
+  go_plot_list[[label]] <- p
+}
+
+go_panel <-
+  go_plot_list[[layout_mat[1,1]]] /
+  go_plot_list[[layout_mat[2,1]]] /
+  go_plot_list[[layout_mat[3,1]]] +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8)
+  )
+
+ggsave(
+  filename = file.path(results_dir, "inoculated_wald_GO_3x1_panel_down.png"),
+  plot     = go_panel,
+  width    = 6.5,
+  height   = 9,
+  units    = "in",
+  dpi      = 600,
+  bg       = "white"
+)
+
+
+```
+
